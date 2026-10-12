@@ -153,11 +153,11 @@ static int axis_init(struct axis *a, int tablet, int tablet_um,
 static int xform_init(struct xform *f, const struct tablet *t,
                       unsigned int w_um, unsigned int h_um, unsigned int x_um,
                       unsigned int y_um, unsigned int rot) {
-  int sideways = rot == 90 || rot == 270;
-  int x_reversed = rot == 180 || rot == 270;
-  int y_reversed = rot == 90 || rot == 180;
+  int sideways = rot & 1; /* quarter turns */
+  int x_reversed = rot == 2 || rot == 3;
+  int y_reversed = rot == 1 || rot == 2;
 
-  if (rot != 0 && rot != 90 && rot != 180 && rot != 270)
+  if (rot > 3)
     return -1;
   f->swap = sideways;
   if (sideways)
@@ -185,17 +185,23 @@ static __always_inline void xform(const struct xform *f, int pen_x, int pen_y,
 
 #ifdef __KERNEL__
 
+enum { CFG_W, CFG_H, CFG_X, CFG_Y, CFG_ROT, CFG_PRESSURE };
+
 struct lumenrx {
   struct input_dev *input;
   struct xform f;
   struct pen pen;
   int x, y;    /* last sent */
   u8 btn, fmt; /* btn: last sent; bit 0 tip, bits 1-2 pen buttons */
+  u16 click;   /* raw pressure above this is a click */
+  /* raw_event never reads past here */
+  unsigned int cfg[CFG_PRESSURE]; /* what f was built from */
 } ____cacheline_aligned;
-static_assert(sizeof(struct lumenrx) == SMP_CACHE_BYTES);
+static_assert(offsetof(struct lumenrx, cfg) == SMP_CACHE_BYTES);
 
+/* defaults for new devices */
 static unsigned int area_w, area_h, area_x, area_y, rotation;
-static int pressure __read_mostly;
+static unsigned short pressure;
 module_param(area_w, uint, 0444);
 MODULE_PARM_DESC(area_w, "area width in um, 0 = whole tablet");
 module_param(area_h, uint, 0444);
@@ -205,8 +211,8 @@ MODULE_PARM_DESC(area_x, "area centre in um, 0 = tablet centre");
 module_param(area_y, uint, 0444);
 MODULE_PARM_DESC(area_y, "area centre in um, 0 = tablet centre");
 module_param(rotation, uint, 0444);
-MODULE_PARM_DESC(rotation, "tablet rotation in deg");
-module_param(pressure, int, 0644);
+MODULE_PARM_DESC(rotation, "tablet rotation: 0-3 for 0, 90, 180, 270 deg");
+module_param(pressure, ushort, 0444);
 MODULE_PARM_DESC(pressure, "raw pressure for a click");
 
 /*
@@ -225,7 +231,7 @@ static int lumenrx_raw_event(struct hid_device *hdev, struct hid_report *report,
     return DONE;
   lx->pen = p;
   xform(&lx->f, p.x, p.y, &x, &y);
-  btn = (p.pressure > pressure) | p.buttons << 1;
+  btn = (p.pressure > lx->click) | p.buttons << 1;
   /* m: bit 0 x moved, bit 1 y moved, bits 2-4 the buttons that flipped */
   m = (x != lx->x) | (y != lx->y) << 1 | (btn ^ lx->btn) << 2;
   if (!m)
@@ -280,13 +286,128 @@ static int lumenrx_set_mode(struct hid_device *hdev) {
   return 0;
 }
 
-static void lumenrx_free(void *lx) { kfree(lx); }
+static int lumenrx_apply(struct hid_device *hdev, struct lumenrx *lx) {
+  const struct tablet *t =
+      (const void *)hid_match_id(hdev, lumenrx_ids)->driver_data;
+
+  int max[2] = {t->max_x, t->max_y}, um[2] = {t->width_um, t->height_um};
+  const unsigned int *c = lx->cfg;
+  struct input_dev *input;
+  struct xform f;
+  int ret;
+
+  if (xform_init(&f, t, c[CFG_W], c[CFG_H], c[CFG_X], c[CFG_Y], c[CFG_ROT])) {
+    hid_err(hdev, "bad rotation, or area larger than the %dx%d um tablet\n",
+            t->width_um, t->height_um);
+    return -EINVAL;
+  }
+
+  input = input_allocate_device();
+  if (!input)
+    return -ENOMEM;
+
+  input->name = t->name;
+  input->phys = hdev->phys;
+  input->dev.parent = &hdev->dev;
+  input->id.bustype =
+      BUS_VIRTUAL; /* with Wacom's ids userspace expects a tablet */
+
+  input_set_capability(input, EV_KEY, BTN_LEFT);
+  input_set_capability(input, EV_KEY, BTN_RIGHT);
+  input_set_capability(input, EV_KEY, BTN_MIDDLE);
+  input_set_abs_params(input, ABS_X, 0, f.x.size, 0, 0);
+  input_set_abs_params(input, ABS_Y, 0, f.y.size, 0, 0);
+  input_abs_set_res(input, ABS_X,
+                    max[f.swap] * 1000 / um[f.swap]); /* units per mm */
+  input_abs_set_res(input, ABS_Y, max[!f.swap] * 1000 / um[!f.swap]);
+
+  ret = input_register_device(input);
+  if (ret) {
+    input_free_device(input);
+    return ret;
+  }
+
+  if (lx->input)
+    input_unregister_device(lx->input);
+
+  lx->input = input;
+  lx->f = f;
+  lx->x = lx->y = -1; /* the new device has seen nothing yet */
+  lx->btn = 0;
+
+  hid_info(hdev, "%s, area %dx%d units, rotation %u\n", t->name, f.x.size,
+           f.y.size, c[CFG_ROT]);
+
+  return 0;
+}
+
+static ssize_t cfg_show(struct device *dev, struct device_attribute *attr,
+                        char *buf);
+static ssize_t cfg_store(struct device *dev, struct device_attribute *attr,
+                         const char *buf, size_t count);
+#define CFG_ATTR(name) __ATTR(name, 0644, cfg_show, cfg_store)
+static struct device_attribute cfg_attrs[] = {
+    [CFG_W] = CFG_ATTR(area_w),     [CFG_H] = CFG_ATTR(area_h),
+    [CFG_X] = CFG_ATTR(area_x),     [CFG_Y] = CFG_ATTR(area_y),
+    [CFG_ROT] = CFG_ATTR(rotation), [CFG_PRESSURE] = CFG_ATTR(pressure)};
+static struct attribute *lumenrx_attrs[] = {&cfg_attrs[CFG_W].attr,
+                                            &cfg_attrs[CFG_H].attr,
+                                            &cfg_attrs[CFG_X].attr,
+                                            &cfg_attrs[CFG_Y].attr,
+                                            &cfg_attrs[CFG_ROT].attr,
+                                            &cfg_attrs[CFG_PRESSURE].attr,
+                                            NULL};
+ATTRIBUTE_GROUPS(lumenrx);
+
+static ssize_t cfg_show(struct device *dev, struct device_attribute *attr,
+                        char *buf) {
+  struct lumenrx *lx = dev_get_drvdata(dev);
+  int i = attr - cfg_attrs;
+
+  return sysfs_emit(buf, "%u\n", i == CFG_PRESSURE ? lx->click : lx->cfg[i]);
+}
+
+static ssize_t cfg_store(struct device *dev, struct device_attribute *attr,
+                         const char *buf, size_t count) {
+  struct hid_device *hdev = to_hid_device(dev);
+  struct lumenrx *lx = hid_get_drvdata(hdev);
+  int i = attr - cfg_attrs, ret;
+  unsigned int v, old;
+
+  ret = kstrtouint(buf, 0, &v);
+  if (ret)
+    return ret;
+
+  if (i == CFG_PRESSURE) {
+    if (v > U16_MAX)
+      return -EINVAL;
+    lx->click = v;
+    return count;
+  }
+
+  /* hid-core drops reports while this is held, so raw_event stays out */
+  down(&hdev->driver_input_lock);
+  old = lx->cfg[i];
+  lx->cfg[i] = v;
+  ret = lumenrx_apply(hdev, lx);
+  if (ret)
+    lx->cfg[i] = old;
+  up(&hdev->driver_input_lock);
+  return ret ?: count;
+}
+
+/* runs after remove() or after a failed probe */
+static void lumenrx_free(void *data) {
+  struct lumenrx *lx = data;
+
+  if (lx->input)
+    input_unregister_device(lx->input);
+  kfree(lx);
+}
 
 static int lumenrx_probe(struct hid_device *hdev,
                          const struct hid_device_id *id) {
   const struct tablet *t = (const void *)id->driver_data;
-  int max[2] = {t->max_x, t->max_y}, um[2] = {t->width_um, t->height_um};
-  struct input_dev *input;
   struct lumenrx *lx;
   int ret;
 
@@ -303,32 +424,15 @@ static int lumenrx_probe(struct hid_device *hdev,
   ret = devm_add_action_or_reset(&hdev->dev, lumenrx_free, lx);
   if (ret)
     return ret;
-  input = devm_input_allocate_device(&hdev->dev);
-  if (!input)
-    return -ENOMEM;
-  if (xform_init(&lx->f, t, area_w, area_h, area_x, area_y, rotation)) {
-    hid_err(hdev, "bad rotation, or area larger than the %dx%d um tablet\n",
-            t->width_um, t->height_um);
-    return -EINVAL;
-  }
+  lx->cfg[CFG_W] = area_w;
+  lx->cfg[CFG_H] = area_h;
+  lx->cfg[CFG_X] = area_x;
+  lx->cfg[CFG_Y] = area_y;
+  lx->cfg[CFG_ROT] = rotation;
+  lx->click = pressure;
   lx->fmt = t->fmt;
-  lx->input = input;
   hid_set_drvdata(hdev, lx);
-
-  input->name = "lumenrx pointer";
-  input->phys = hdev->phys;
-  input->id.bustype =
-      BUS_VIRTUAL; /* with Wacom's ids userspace expects a tablet */
-  input_set_capability(input, EV_KEY, BTN_LEFT);
-  input_set_capability(input, EV_KEY, BTN_RIGHT);
-  input_set_capability(input, EV_KEY, BTN_MIDDLE);
-  input_set_abs_params(input, ABS_X, 0, lx->f.x.size, 0, 0);
-  input_set_abs_params(input, ABS_Y, 0, lx->f.y.size, 0, 0);
-  input_abs_set_res(input, ABS_X,
-                    max[lx->f.swap] * 1000 / um[lx->f.swap]); /* units per mm */
-  input_abs_set_res(input, ABS_Y, max[!lx->f.swap] * 1000 / um[!lx->f.swap]);
-
-  ret = input_register_device(input);
+  ret = lumenrx_apply(hdev, lx);
   if (ret)
     return ret;
 
@@ -348,8 +452,6 @@ static int lumenrx_probe(struct hid_device *hdev,
     return ret;
   }
 
-  hid_info(hdev, "%s, area %dx%d units, rotation %u\n", t->name, lx->f.x.size,
-           lx->f.y.size, rotation);
   return 0;
 }
 
@@ -364,6 +466,7 @@ static struct hid_driver lumenrx_driver = {
     .probe = lumenrx_probe,
     .remove = lumenrx_remove,
     .raw_event = lumenrx_raw_event,
+    .driver = {.dev_groups = lumenrx_groups},
 #ifdef CONFIG_PM
     .resume = lumenrx_set_mode,
     .reset_resume = lumenrx_set_mode,
@@ -397,9 +500,10 @@ int main(void) {
                 0xa0, 0x73, 0x00, 0xff, 0x0f};
   int i;
 
-  assert(xform_init(&f, &t, 0, 0, 0, 0, 45));
+  assert(xform_init(&f, &t, 0, 0, 0, 0, 4));
+  assert(xform_init(&f, &t, 0, 0, 0, 0, 90));
   assert(xform_init(&f, &t, 153000, 95000, 0, 0, 0));
-  assert(xform_init(&f, &t, 152000, 95000, 0, 0, 90));
+  assert(xform_init(&f, &t, 152000, 95000, 0, 0, 1));
   assert(xform_init(&f, &t, ~0u, ~0u, 0, 0, 0));
 
   assert(!xform_init(&f, &t, 100000, 50000, 0, 0, 0));
@@ -407,15 +511,15 @@ int main(void) {
   assert(at(&f, 7600, 4750, 5000, 2500)); /* centre -> centre */
   assert(at(&f, 0, 9500, 0, 5000));       /* outside clamps */
 
-  assert(!xform_init(&f, &t, 0, 0, 0, 0, 180));
+  assert(!xform_init(&f, &t, 0, 0, 0, 0, 2));
   assert(at(&f, 0, 0, 15200, 9500) && at(&f, 15200, 9500, 0, 0));
 
-  /* rotation as in OpenTabletDriver: at 90 the tablet's top-right is 0,0 */
-  assert(!xform_init(&f, &t, 0, 0, 0, 0, 90));
+  /* rotation as in otd, at 1 (90 deg) the tablet's top-right is 0,0 */
+  assert(!xform_init(&f, &t, 0, 0, 0, 0, 1));
   assert(f.x.size == 9500 && f.y.size == 15200);
   assert(at(&f, 15200, 0, 0, 0) && at(&f, 0, 9500, 9500, 15200));
 
-  assert(!xform_init(&f, &t, 50000, 100000, 0, 0, 270));
+  assert(!xform_init(&f, &t, 50000, 100000, 0, 0, 3));
   assert(f.x.size == 5000 && f.y.size == 10000);
   assert(at(&f, 0, 9500, 0, 0)); /* bottom-left -> top-left clamped */
   assert(at(&f, 7600, 4750, 2500, 5000));
@@ -423,11 +527,11 @@ int main(void) {
   assert(!xform_init(&f, &t, 100000, 50000, 60000, 30000, 0));
   assert(at(&f, 1000, 500, 0, 0) && at(&f, 6000, 3000, 5000, 2500));
   /* the centre is in the tablet's own frame, whatever the rotation */
-  assert(!xform_init(&f, &t, 100000, 50000, 60000, 30000, 180));
+  assert(!xform_init(&f, &t, 100000, 50000, 60000, 30000, 2));
   assert(at(&f, 11000, 5500, 0, 0) && at(&f, 6000, 3000, 5000, 2500));
   assert(!xform_init(&f, &t, 100000, 50000, 10000, ~0u, 0));
   assert(at(&f, 0, 4500, 0, 0) && at(&f, 10000, 9500, 10000, 5000));
-  assert(!xform_init(&f, &t, 50000, 100000, 20000, 0, 90) &&
+  assert(!xform_init(&f, &t, 50000, 100000, 20000, 0, 1) &&
          at(&f, 10000, 2250, 0, 0));
 
   assert(!xform_init(&f, &t, 101600, 50800, 76200, 47500, 0));
