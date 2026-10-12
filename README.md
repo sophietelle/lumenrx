@@ -15,3 +15,6 @@ dmesg | grep lumenrx # check whether the driver has loaded successfully
 ```
 
 3. enjoy!
+
+## ai disclosure
+this project is ai-assisted. i always test and read the code manually before pushing it out.
