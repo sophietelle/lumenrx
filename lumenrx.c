@@ -22,8 +22,7 @@ struct tablet {
   const char *name;
   int max_x, max_y; /* device units */
   int width_um, height_um;
-  u8 fmt, ninit,
-      init[2][2]; /* init: feature reports selecting raw pen reports */
+  u8 fmt, ninit, init[2][2];
 };
 
 struct pen {
@@ -106,61 +105,82 @@ static __always_inline int parse(int fmt, const u8 *r, int size,
   return 1;
 }
 
-/* out = (in ^ f) + c: f is 0, or -1 to mirror the axis (~in + c). */
-struct xform {
-  int swap, fx, cx, w, fy, cy, h;
+struct axis {
+  int negate; /* 0 or -1; in ^ -1 is -in - 1 */
+  int shift;
+  int size;
 };
 
-static int area_start(unsigned int c_mm, int size, int full, int um) {
-  u64 c = div_u64((u64)c_mm * 1000 * full, um);
+struct xform {
+  int swap;
+  struct axis x, y;
+};
 
-  if (!c_mm || c < (u64)size / 2)
-    return c_mm ? 0 : (full - size) / 2;
-  return c - size / 2 > (u64)(full - size) ? full - size : (int)c - size / 2;
+static u64 um_to_units(unsigned int um, int tablet_units, int tablet_um) {
+  return div_u64((u64)um * tablet_units, tablet_um);
 }
 
-/*
- * maps a w_mm x h_mm area of the tablet centred at x_mm, y_mm and seen with
- * the tablet turned rot degrees clockwise, onto 0..w, 0..h.
- */
-static int xform_init(struct xform *f, const struct tablet *t,
-                      unsigned int w_mm, unsigned int h_mm, unsigned int x_mm,
-                      unsigned int y_mm, unsigned int rot) {
-  int max[2] = {t->max_x, t->max_y}, um[2] = {t->width_um, t->height_um};
-  int flipx = rot == 90 || rot == 180, flipy = rot == 180 || rot == 270;
-  int fw, fh; /* tablet size as seen after rotation */
-  u64 w, h;
+static int area_start(unsigned int centre_um, int area, int tablet,
+                      int tablet_um) {
+  int max_start = tablet - area;
+  u64 centre;
 
-  if (rot != 0 && rot != 90 && rot != 180 && rot != 270)
+  if (!centre_um)
+    return max_start / 2;
+  centre = um_to_units(centre_um, tablet, tablet_um);
+  if (centre < (u64)area / 2)
+    return 0;
+  if (centre - area / 2 > (u64)max_start)
+    return max_start;
+  return centre - area / 2;
+}
+
+static int axis_init(struct axis *a, int tablet, int tablet_um,
+                     unsigned int area_um, unsigned int centre_um,
+                     int reversed) {
+  u64 area = area_um ? um_to_units(area_um, tablet, tablet_um) : (u64)tablet;
+  int start;
+
+  if (area > (u64)tablet)
     return -1;
-  f->swap = rot == 90 || rot == 270;
-  fw = max[f->swap];
-  fh = max[!f->swap];
-  w = fw;
-  h = fh;
-  if (w_mm)
-    w = div_u64((u64)w_mm * 1000 * fw, um[f->swap]);
-  if (h_mm)
-    h = div_u64((u64)h_mm * 1000 * fh, um[!f->swap]);
-  if (w > (u64)fw || h > (u64)fh)
-    return -1;
-  f->w = w;
-  f->h = h;
-  f->fx = -flipx;
-  f->fy = -flipy;
-  f->cx = (flipx ? fw + 1 : 0) - area_start(x_mm, f->w, fw, um[f->swap]);
-  f->cy = (flipy ? fh + 1 : 0) - area_start(y_mm, f->h, fh, um[!f->swap]);
+  a->size = area;
+  start = area_start(centre_um, a->size, tablet, tablet_um);
+  a->negate = reversed ? -1 : 0;
+  a->shift = reversed ? start + a->size + 1 : -start;
   return 0;
 }
 
-static __always_inline int clampi(int v, int hi) {
-  return v < 0 ? 0 : v > hi ? hi : v;
+static int xform_init(struct xform *f, const struct tablet *t,
+                      unsigned int w_um, unsigned int h_um, unsigned int x_um,
+                      unsigned int y_um, unsigned int rot) {
+  int sideways = rot == 90 || rot == 270;
+  int x_reversed = rot == 180 || rot == 270;
+  int y_reversed = rot == 90 || rot == 180;
+
+  if (rot != 0 && rot != 90 && rot != 180 && rot != 270)
+    return -1;
+  f->swap = sideways;
+  if (sideways)
+    return axis_init(&f->x, t->max_y, t->height_um, w_um, y_um, x_reversed) ||
+           axis_init(&f->y, t->max_x, t->width_um, h_um, x_um, y_reversed);
+  return axis_init(&f->x, t->max_x, t->width_um, w_um, x_um, x_reversed) ||
+         axis_init(&f->y, t->max_y, t->height_um, h_um, y_um, y_reversed);
 }
 
-static __always_inline void xform(const struct xform *f, int px, int py, int *x,
-                                  int *y) {
-  *x = clampi(((f->swap ? py : px) ^ f->fx) + f->cx, f->w);
-  *y = clampi(((f->swap ? px : py) ^ f->fy) + f->cy, f->h);
+static __always_inline int axis_apply(const struct axis *a, int in) {
+  int out = (in ^ a->negate) + a->shift;
+
+  if (out > a->size)
+    out = a->size;
+  if (out < 0)
+    out = 0;
+  return out;
+}
+
+static __always_inline void xform(const struct xform *f, int pen_x, int pen_y,
+                                  int *x, int *y) {
+  *x = axis_apply(&f->x, f->swap ? pen_y : pen_x);
+  *y = axis_apply(&f->y, f->swap ? pen_x : pen_y);
 }
 
 #ifdef __KERNEL__
@@ -177,13 +197,13 @@ static_assert(sizeof(struct lumenrx) == SMP_CACHE_BYTES);
 static unsigned int area_w, area_h, area_x, area_y, rotation;
 static int pressure __read_mostly;
 module_param(area_w, uint, 0444);
-MODULE_PARM_DESC(area_w, "area width in mm, 0 = whole tablet");
+MODULE_PARM_DESC(area_w, "area width in um, 0 = whole tablet");
 module_param(area_h, uint, 0444);
-MODULE_PARM_DESC(area_h, "area height in mm, 0 = whole tablet");
+MODULE_PARM_DESC(area_h, "area height in um, 0 = whole tablet");
 module_param(area_x, uint, 0444);
-MODULE_PARM_DESC(area_x, "area centre, 0 = tablet centre");
+MODULE_PARM_DESC(area_x, "area centre in um, 0 = tablet centre");
 module_param(area_y, uint, 0444);
-MODULE_PARM_DESC(area_y, "area centre, 0 = tablet centre");
+MODULE_PARM_DESC(area_y, "area centre in um, 0 = tablet centre");
 module_param(rotation, uint, 0444);
 MODULE_PARM_DESC(rotation, "tablet rotation in deg");
 module_param(pressure, int, 0644);
@@ -287,8 +307,8 @@ static int lumenrx_probe(struct hid_device *hdev,
   if (!input)
     return -ENOMEM;
   if (xform_init(&lx->f, t, area_w, area_h, area_x, area_y, rotation)) {
-    hid_err(hdev, "bad rotation, or area larger than the %dx%d mm tablet\n",
-            t->width_um / 1000, t->height_um / 1000);
+    hid_err(hdev, "bad rotation, or area larger than the %dx%d um tablet\n",
+            t->width_um, t->height_um);
     return -EINVAL;
   }
   lx->fmt = t->fmt;
@@ -302,8 +322,8 @@ static int lumenrx_probe(struct hid_device *hdev,
   input_set_capability(input, EV_KEY, BTN_LEFT);
   input_set_capability(input, EV_KEY, BTN_RIGHT);
   input_set_capability(input, EV_KEY, BTN_MIDDLE);
-  input_set_abs_params(input, ABS_X, 0, lx->f.w, 0, 0);
-  input_set_abs_params(input, ABS_Y, 0, lx->f.h, 0, 0);
+  input_set_abs_params(input, ABS_X, 0, lx->f.x.size, 0, 0);
+  input_set_abs_params(input, ABS_Y, 0, lx->f.y.size, 0, 0);
   input_abs_set_res(input, ABS_X,
                     max[lx->f.swap] * 1000 / um[lx->f.swap]); /* units per mm */
   input_abs_set_res(input, ABS_Y, max[!lx->f.swap] * 1000 / um[!lx->f.swap]);
@@ -328,8 +348,8 @@ static int lumenrx_probe(struct hid_device *hdev,
     return ret;
   }
 
-  hid_info(hdev, "%s, area %dx%d units, rotation %u\n", t->name, lx->f.w,
-           lx->f.h, rotation);
+  hid_info(hdev, "%s, area %dx%d units, rotation %u\n", t->name, lx->f.x.size,
+           lx->f.y.size, rotation);
   return 0;
 }
 
@@ -378,33 +398,40 @@ int main(void) {
   int i;
 
   assert(xform_init(&f, &t, 0, 0, 0, 0, 45));
-  assert(xform_init(&f, &t, 153, 95, 0, 0, 0));
-  assert(xform_init(&f, &t, 152, 95, 0, 0, 90));
+  assert(xform_init(&f, &t, 153000, 95000, 0, 0, 0));
+  assert(xform_init(&f, &t, 152000, 95000, 0, 0, 90));
   assert(xform_init(&f, &t, ~0u, ~0u, 0, 0, 0));
 
-  assert(!xform_init(&f, &t, 100, 50, 0, 0, 0) && f.w == 10000 && f.h == 5000);
+  assert(!xform_init(&f, &t, 100000, 50000, 0, 0, 0));
+  assert(f.x.size == 10000 && f.y.size == 5000);
   assert(at(&f, 7600, 4750, 5000, 2500)); /* centre -> centre */
   assert(at(&f, 0, 9500, 0, 5000));       /* outside clamps */
 
   assert(!xform_init(&f, &t, 0, 0, 0, 0, 180));
   assert(at(&f, 0, 0, 15200, 9500) && at(&f, 15200, 9500, 0, 0));
 
-  /* turned 90deg the tablet's bottom-left corner is the user's top-left */
-  assert(!xform_init(&f, &t, 0, 0, 0, 0, 90) && f.w == 9500 && f.h == 15200);
-  assert(at(&f, 0, 9500, 0, 0) && at(&f, 15200, 0, 9500, 15200));
+  /* rotation as in OpenTabletDriver: at 90 the tablet's top-right is 0,0 */
+  assert(!xform_init(&f, &t, 0, 0, 0, 0, 90));
+  assert(f.x.size == 9500 && f.y.size == 15200);
+  assert(at(&f, 15200, 0, 0, 0) && at(&f, 0, 9500, 9500, 15200));
 
-  assert(!xform_init(&f, &t, 50, 100, 0, 0, 270) && f.w == 5000 &&
-         f.h == 10000);
-  assert(at(&f, 15200, 0, 0, 0)); /* top-right -> top-left clamped */
+  assert(!xform_init(&f, &t, 50000, 100000, 0, 0, 270));
+  assert(f.x.size == 5000 && f.y.size == 10000);
+  assert(at(&f, 0, 9500, 0, 0)); /* bottom-left -> top-left clamped */
   assert(at(&f, 7600, 4750, 2500, 5000));
 
-  assert(!xform_init(&f, &t, 100, 50, 60, 30, 0));
+  assert(!xform_init(&f, &t, 100000, 50000, 60000, 30000, 0));
   assert(at(&f, 1000, 500, 0, 0) && at(&f, 6000, 3000, 5000, 2500));
-  assert(!xform_init(&f, &t, 100, 50, 60, 30, 180));
-  assert(at(&f, 14200, 9000, 0, 0) && at(&f, 9200, 6500, 5000, 2500));
-  assert(!xform_init(&f, &t, 100, 50, 10, ~0u, 0));
+  /* the centre is in the tablet's own frame, whatever the rotation */
+  assert(!xform_init(&f, &t, 100000, 50000, 60000, 30000, 180));
+  assert(at(&f, 11000, 5500, 0, 0) && at(&f, 6000, 3000, 5000, 2500));
+  assert(!xform_init(&f, &t, 100000, 50000, 10000, ~0u, 0));
   assert(at(&f, 0, 4500, 0, 0) && at(&f, 10000, 9500, 10000, 5000));
-  assert(!xform_init(&f, &t, 50, 100, 20, 0, 90) && at(&f, 2600, 9500, 0, 0));
+  assert(!xform_init(&f, &t, 50000, 100000, 20000, 0, 90) &&
+         at(&f, 10000, 2250, 0, 0));
+
+  assert(!xform_init(&f, &t, 101600, 50800, 76200, 47500, 0));
+  assert(f.x.size == 10160 && at(&f, 2540, 2210, 0, 0));
 
   assert(!parse(INTUOS, out, 10, &p)); /* nothing held, nothing to release */
   assert(!parse(INTUOS, in, 7, &p));   /* too short to read */
